@@ -27,25 +27,42 @@ pub fn render(f: &mut Frame, app: &AppState) {
     let body_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(30), // Left: Mesh List
-            Constraint::Percentage(70), // Right: Events + Log Focus
+            Constraint::Percentage(25), // Left: Agent List + Sparkline
+            Constraint::Percentage(75), // Right: Metrics + Logs
         ])
         .split(main_chunks[1]);
 
-    let right_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(60), // Top-Right: Event Stream
-            Constraint::Percentage(40), // Bottom-Right: Log Focus
-        ])
-        .split(body_chunks[1]);
-
     // 2. Render Components
     render_header(f, app, main_chunks[0]);
-    render_mesh_list(f, app, body_chunks[0]);
-    render_event_stream(f, app, right_chunks[0]);
-    render_log_focus(f, app, right_chunks[1]);
+    render_left_pane(f, app, body_chunks[0]);
+    render_right_pane(f, app, body_chunks[1]);
     render_footer(f, main_chunks[2]);
+}
+
+fn render_left_pane(f: &mut Frame, app: &AppState, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),         // Agent List
+            Constraint::Length(7),      // Sparkline area
+        ])
+        .split(area);
+
+    render_mesh_list(f, app, chunks[0]);
+    render_activity_sparkline(f, app, chunks[1]);
+}
+
+fn render_right_pane(f: &mut Frame, app: &AppState, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(8),      // Metrics Summary
+            Constraint::Min(0),         // Execution Logs
+        ])
+        .split(area);
+
+    render_metrics_summary(f, app, chunks[0]);
+    render_log_focus(f, app, chunks[1]);
 }
 
 fn render_header(f: &mut Frame, app: &AppState, area: Rect) {

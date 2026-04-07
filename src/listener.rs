@@ -20,6 +20,9 @@ pub async fn start_simulated_listener(tx: mpsc::Sender<Event>, agent_tx: mpsc::S
             status: AgentStatus::Idle,
             git_locked: false,
             last_seen: Local::now(),
+            tokens: 0,
+            branch: "main".to_string(),
+            activity: std::collections::VecDeque::new(),
         };
         let _ = agent_tx.send(agent).await;
     }
@@ -32,9 +35,10 @@ pub async fn start_simulated_listener(tx: mpsc::Sender<Event>, agent_tx: mpsc::S
         let agent_id = agent_ids[agent_idx];
         
         let event_type = rand::random_range(0..3);
+        let branch_name = format!("feat/RAI-{}", rand::random_range(100..999));
         let (kind, payload, new_status, new_git_lock) = match event_type {
             0 => ("Joined", "Agent joined the mesh network.", AgentStatus::Idle, false),
-            1 => ("Updated", "Working on branch 'feat/mesh-ui'.", AgentStatus::Busy, true),
+            1 => ("Updated", format!("Working on branch '{}'.", branch_name), AgentStatus::Busy, true),
             2 => ("TaskExecuted", "Ran unit tests in wasp sandbox.", AgentStatus::Idle, false),
             _ => unreachable!(),
         };
@@ -55,6 +59,9 @@ pub async fn start_simulated_listener(tx: mpsc::Sender<Event>, agent_tx: mpsc::S
             status: new_status,
             git_locked: new_git_lock,
             last_seen: Local::now(),
+            tokens: rand::random_range(500..5000), // Simulate token usage
+            branch: branch_name,
+            activity: std::collections::VecDeque::new(),
         };
         let _ = agent_tx.send(updated_agent).await;
     }
