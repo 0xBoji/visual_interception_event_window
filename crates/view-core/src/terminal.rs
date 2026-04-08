@@ -69,11 +69,7 @@ pub async fn start_local_shell(
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = reader.next_line().await {
-                let cleaned = line
-                    .replace('\u{8}', "")
-                    .replace('\u{1b}', "")
-                    .trim()
-                    .to_string();
+                let cleaned = sanitize_terminal_line(&line);
                 if !cleaned.is_empty() {
                     let _ = event_tx.send(TerminalEvent::Line(cleaned));
                 }
@@ -92,14 +88,61 @@ pub async fn start_local_shell(
     Ok(())
 }
 
+fn sanitize_terminal_line(line: &str) -> String {
+    let mut output = String::with_capacity(line.len());
+    let chars = line.chars().collect::<Vec<_>>();
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        match chars[index] {
+            '\u{8}' => {
+                output.pop();
+                index += 1;
+            }
+            '\u{1b}' => {
+                index += 1;
+                if index < chars.len() && chars[index] == '[' {
+                    index += 1;
+                    while index < chars.len() {
+                        let ch = chars[index];
+                        index += 1;
+                        if ('@'..='~').contains(&ch) {
+                            break;
+                        }
+                    }
+                }
+            }
+            '\r' => {
+                output.clear();
+                index += 1;
+            }
+            ch if ch.is_control() && ch != '\t' => {
+                index += 1;
+            }
+            ch => {
+                output.push(ch);
+                index += 1;
+            }
+        }
+    }
+
+    output.trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::local_shell_command_tx;
+    use super::{local_shell_command_tx, sanitize_terminal_line};
 
     #[test]
     fn local_shell_command_channel_should_send_commands() {
         let (tx, mut rx) = local_shell_command_tx();
         tx.send("echo test".to_string()).expect("send");
         assert_eq!(rx.try_recv().expect("recv"), "echo test".to_string());
+    }
+
+    #[test]
+    fn sanitize_terminal_line_should_strip_ansi_and_backspaces() {
+        let line = "\u{1b}[32mVIEW\u{1b}[0m sh\u{8}hell ready\r$ echo hi";
+        assert_eq!(sanitize_terminal_line(line), "$ echo hi");
     }
 }
