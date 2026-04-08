@@ -10,6 +10,6 @@ categories = ["development-tools", "gui"]
 
 [dependencies]
 view-core = { path = "../view-core" }
-eframe = "0.27"
+eframe = { version = "0.27", features = ["__screenshot"] }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"

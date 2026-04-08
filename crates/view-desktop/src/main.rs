@@ -2,7 +2,7 @@ mod desktop_app;
 
 use anyhow::Result;
 use desktop_app::ViewDesktopApp;
-use eframe::egui;
+use eframe::{egui, Renderer};
 
 fn main() -> Result<()> {
     let options = eframe::NativeOptions {
@@ -10,6 +10,7 @@ fn main() -> Result<()> {
             .with_title("VIEW Desktop")
             .with_inner_size([1600.0, 980.0])
             .with_min_inner_size([960.0, 640.0]),
+        renderer: Renderer::Glow,
         ..eframe::NativeOptions::default()
     };
 
