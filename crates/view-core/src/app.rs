@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 /// Maximum number of events to retain in the buffer.
 const EVENT_LIMIT: usize = 100;
+const TERMINAL_LINE_LIMIT: usize = 400;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
@@ -79,6 +80,24 @@ pub enum ViewMode {
     Focus,
 }
 
+pub struct TerminalState {
+    pub title: String,
+    pub cwd: String,
+    pub status: String,
+    pub lines: VecDeque<String>,
+}
+
+impl Default for TerminalState {
+    fn default() -> Self {
+        Self {
+            title: "local-shell".to_string(),
+            cwd: String::new(),
+            status: "starting".to_string(),
+            lines: VecDeque::new(),
+        }
+    }
+}
+
 pub struct AppState {
     pub agents: BTreeMap<String, Agent>,
     pub events: VecDeque<Event>,
@@ -89,6 +108,7 @@ pub struct AppState {
     pub search_query: String,
     pub search_mode: bool,
     pub view_mode: ViewMode,
+    pub terminal: TerminalState,
 }
 
 impl Default for AppState {
@@ -109,6 +129,7 @@ impl AppState {
             search_query: String::new(),
             search_mode: false,
             view_mode: ViewMode::Grid,
+            terminal: TerminalState::default(),
         }
     }
 
@@ -236,6 +257,31 @@ impl AppState {
     pub fn set_search_query(&mut self, query: &str) {
         self.search_query = query.to_string();
         self.clamp_selection();
+    }
+
+    pub fn append_terminal_line(&mut self, line: impl Into<String>) {
+        if self.terminal.lines.len() >= TERMINAL_LINE_LIMIT {
+            self.terminal.lines.pop_front();
+        }
+        self.terminal.lines.push_back(line.into());
+    }
+
+    pub fn set_terminal_status(&mut self, status: impl Into<String>) {
+        self.terminal.status = status.into();
+    }
+
+    pub fn set_terminal_cwd(&mut self, cwd: impl Into<String>) {
+        self.terminal.cwd = cwd.into();
+    }
+
+    pub fn recent_terminal_lines(&self, limit: usize) -> Vec<&str> {
+        let len = self.terminal.lines.len();
+        self.terminal
+            .lines
+            .iter()
+            .skip(len.saturating_sub(limit))
+            .map(String::as_str)
+            .collect()
     }
 
     pub fn select_visible_index(&mut self, index: usize) {
@@ -525,6 +571,21 @@ mod tests {
 
         assert_eq!(app.visible_agent_ids(), vec!["beta".to_string()]);
         assert_eq!(app.get_selected_agent_id(), Some("beta".to_string()));
+    }
+
+    #[test]
+    fn terminal_state_should_keep_recent_lines_only() {
+        let mut app = AppState::new();
+        app.set_terminal_status("ready");
+        app.set_terminal_cwd("/tmp/view-shell");
+        for index in 0..405 {
+            app.append_terminal_line(format!("line-{index}"));
+        }
+
+        assert_eq!(app.terminal.status, "ready");
+        assert_eq!(app.terminal.cwd, "/tmp/view-shell");
+        assert_eq!(app.terminal.lines.len(), 400);
+        assert_eq!(app.recent_terminal_lines(2), vec!["line-403", "line-404"]);
     }
 
     #[test]

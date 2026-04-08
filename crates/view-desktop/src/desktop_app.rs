@@ -14,6 +14,7 @@ use tokio::time::{self, Duration};
 use view_core::{
     app::{Agent, AppState, ViewMode},
     listener,
+    terminal::{self, TerminalEvent},
 };
 
 const BG_APP: Color32 = Color32::from_rgb(10, 11, 14);
@@ -34,6 +35,8 @@ const DANGER: Color32 = Color32::from_rgb(255, 96, 96);
 pub struct ViewDesktopApp {
     state: Arc<Mutex<AppState>>,
     search_buffer: String,
+    shell_input: String,
+    shell_tx: terminal::TerminalCommandTx,
     frame_count: u64,
     screenshot_requested: bool,
     screenshot_target: Option<PathBuf>,
@@ -45,11 +48,13 @@ impl ViewDesktopApp {
         configure_theme(&cc.egui_ctx);
 
         let state = Arc::new(Mutex::new(AppState::new()));
-        spawn_core_runtime(state.clone());
+        let shell_tx = spawn_core_runtime(state.clone());
 
         Self {
             state,
             search_buffer: String::new(),
+            shell_input: String::new(),
+            shell_tx,
             frame_count: 0,
             screenshot_requested: false,
             screenshot_target: screenshot_target(),
@@ -106,7 +111,9 @@ impl eframe::App for ViewDesktopApp {
             .frame(Frame::new().fill(BG_APP))
             .show(ctx, |ui| match state.view_mode {
                 ViewMode::Grid => render_grid(ui, &mut state),
-                ViewMode::Focus => render_focus(ui, &mut state),
+                ViewMode::Focus => {
+                    render_focus(ui, &mut state, &mut self.shell_input, &self.shell_tx)
+                }
             });
 
         drop(state);
@@ -156,7 +163,7 @@ impl ViewDesktopApp {
 }
 
 fn render_header(ui: &mut egui::Ui, state: &mut AppState, search_buffer: &mut String) {
-    let page_size = grid_page_size(ui.available_width());
+    let page_size = grid_agent_page_size(ui.available_width());
     let tabs = state.visible_agents_page(page_size);
     let selected = state.get_selected_agent_id();
     let current_page = state.current_grid_page(page_size) + 1;
@@ -236,7 +243,7 @@ fn render_header(ui: &mut egui::Ui, state: &mut AppState, search_buffer: &mut St
 fn render_grid(ui: &mut egui::Ui, state: &mut AppState) {
     let columns = grid_columns_for_width(ui.available_width());
     let rows = grid_rows();
-    let page_size = columns * rows;
+    let page_size = grid_agent_page_size(ui.available_width());
     let ids = state.visible_agents_page(page_size);
     let selected = state.get_selected_agent_id();
     let spacing = 10.0;
@@ -257,7 +264,9 @@ fn render_grid(ui: &mut egui::Ui, state: &mut AppState) {
                             tile_size,
                             Layout::top_down(Align::LEFT),
                             |ui| {
-                                if let Some(id) = ids.get(index) {
+                                if index == 0 {
+                                    render_shell_tile(ui, state, tile_size);
+                                } else if let Some(id) = ids.get(index - 1) {
                                     if let Some(agent) = state.agents.get(id).cloned() {
                                         let is_selected = selected.as_deref() == Some(id.as_str());
                                         render_tile(
@@ -283,7 +292,12 @@ fn render_grid(ui: &mut egui::Ui, state: &mut AppState) {
         });
 }
 
-fn render_focus(ui: &mut egui::Ui, state: &mut AppState) {
+fn render_focus(
+    ui: &mut egui::Ui,
+    state: &mut AppState,
+    shell_input: &mut String,
+    shell_tx: &terminal::TerminalCommandTx,
+) {
     ui.columns(2, |columns| {
         columns[0].heading("Sessions");
         for (index, id) in state.visible_agent_ids().iter().enumerate() {
@@ -300,8 +314,12 @@ fn render_focus(ui: &mut egui::Ui, state: &mut AppState) {
         columns[1].heading("Detail");
         if let Some(agent) = state.get_selected_agent().cloned() {
             render_focus_detail(&mut columns[1], &agent, state);
+            columns[1].add_space(12.0);
+            render_shell_pane(&mut columns[1], state, shell_input, shell_tx);
         } else {
             columns[1].label("No session selected.");
+            columns[1].add_space(12.0);
+            render_shell_pane(&mut columns[1], state, shell_input, shell_tx);
         }
     });
 }
@@ -580,6 +598,101 @@ fn render_focus_detail(ui: &mut egui::Ui, agent: &Agent, state: &AppState) {
         });
 }
 
+fn render_shell_tile(ui: &mut egui::Ui, state: &AppState, tile_size: Vec2) {
+    let lines = state.recent_terminal_lines(8);
+
+    Frame::new()
+        .fill(BG_PANEL)
+        .stroke(Stroke::new(2.0, SPLIT_LINE))
+        .corner_radius(12.0)
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.set_min_size(tile_size);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("◉").color(SUCCESS).size(14.0));
+                ui.label(RichText::new(&state.terminal.title).strong().size(16.0));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    chip(ui, &state.terminal.status.to_uppercase(), SPLIT_LINE, false);
+                });
+            });
+            ui.label(
+                RichText::new(truncate_path(&state.terminal.cwd, 42))
+                    .monospace()
+                    .color(FG_MUTED),
+            );
+            ui.separator();
+
+            if lines.is_empty() {
+                ui.label(
+                    RichText::new("$ zsh\n…waiting for shell output")
+                        .monospace()
+                        .color(FG_MUTED),
+                );
+            } else {
+                for line in lines {
+                    ui.label(RichText::new(line).monospace().color(FG_PRIMARY));
+                }
+            }
+
+            ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
+                ui.separator();
+                ui.label(
+                    RichText::new("$ local shell attached")
+                        .monospace()
+                        .color(SPLIT_LINE),
+                );
+            });
+        });
+}
+
+fn render_shell_pane(
+    ui: &mut egui::Ui,
+    state: &AppState,
+    shell_input: &mut String,
+    shell_tx: &terminal::TerminalCommandTx,
+) {
+    Frame::new()
+        .fill(BG_PANEL)
+        .stroke(Stroke::new(1.0, SPLIT_LINE))
+        .corner_radius(12.0)
+        .inner_margin(egui::Margin::same(12))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("local-shell").strong().size(18.0));
+                ui.label(
+                    RichText::new(format!(
+                        "{} • {}",
+                        state.terminal.status, state.terminal.cwd
+                    ))
+                    .monospace()
+                    .color(FG_MUTED),
+                );
+            });
+            ui.separator();
+
+            ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                for line in state.recent_terminal_lines(14) {
+                    ui.label(RichText::new(line).monospace().color(FG_PRIMARY));
+                }
+            });
+
+            ui.separator();
+            let response = ui.add_sized(
+                [ui.available_width(), 28.0],
+                egui::TextEdit::singleline(shell_input)
+                    .hint_text("run shell command and press Enter"),
+            );
+            if response.lost_focus()
+                && ui.input(|input| input.key_pressed(Key::Enter))
+                && !shell_input.trim().is_empty()
+            {
+                let command = shell_input.trim().to_string();
+                let _ = shell_tx.send(command);
+                shell_input.clear();
+            }
+        });
+}
+
 fn status_color(agent: &Agent) -> Color32 {
     match agent.status.to_ascii_lowercase().as_str() {
         "busy" => WARNING,
@@ -672,6 +785,10 @@ fn grid_page_size(width: f32) -> usize {
     grid_columns_for_width(width) * grid_rows()
 }
 
+fn grid_agent_page_size(width: f32) -> usize {
+    grid_page_size(width).saturating_sub(1).max(1)
+}
+
 fn command_badge(ui: &mut egui::Ui, key: &str, label: &str) {
     ui.group(|ui| {
         ui.horizontal(|ui| {
@@ -681,7 +798,8 @@ fn command_badge(ui: &mut egui::Ui, key: &str, label: &str) {
     });
 }
 
-fn spawn_core_runtime(state: Arc<Mutex<AppState>>) {
+fn spawn_core_runtime(state: Arc<Mutex<AppState>>) -> terminal::TerminalCommandTx {
+    let (shell_tx, shell_rx) = terminal::local_shell_command_tx();
     thread::spawn(move || {
         let runtime = Builder::new_multi_thread()
             .enable_all()
@@ -691,6 +809,7 @@ fn spawn_core_runtime(state: Arc<Mutex<AppState>>) {
         runtime.block_on(async move {
             let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
             let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel(64);
+            let (terminal_event_tx, mut terminal_event_rx) = tokio::sync::mpsc::unbounded_channel();
             let use_demo = listener::demo_mode_enabled() || std::env::var("VIEW_DEMO").is_ok();
 
             tokio::spawn(async move {
@@ -699,6 +818,11 @@ fn spawn_core_runtime(state: Arc<Mutex<AppState>>) {
                 } else {
                     listener::start_camp_listener(event_tx, agent_tx).await
                 };
+            });
+
+            tokio::spawn(async move {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
+                let _ = terminal::start_local_shell(cwd, terminal_event_tx, shell_rx).await;
             });
 
             let mut tick = time::interval(Duration::from_secs(1));
@@ -713,6 +837,14 @@ fn spawn_core_runtime(state: Arc<Mutex<AppState>>) {
                         let mut app = state.lock().await;
                         app.update_agent(agent);
                     }
+                    Some(terminal_event) = terminal_event_rx.recv() => {
+                        let mut app = state.lock().await;
+                        match terminal_event {
+                            TerminalEvent::Line(line) => app.append_terminal_line(line),
+                            TerminalEvent::Status(status) => app.set_terminal_status(status),
+                            TerminalEvent::Cwd(cwd) => app.set_terminal_cwd(cwd),
+                        }
+                    }
                     _ = tick.tick() => {
                         let mut app = state.lock().await;
                         app.tick_activity();
@@ -721,6 +853,7 @@ fn spawn_core_runtime(state: Arc<Mutex<AppState>>) {
             }
         });
     });
+    shell_tx
 }
 
 fn screenshot_target() -> Option<PathBuf> {
