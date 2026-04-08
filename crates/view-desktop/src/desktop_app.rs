@@ -3,6 +3,8 @@ use eframe::egui::{
     ViewportCommand,
 };
 use image::{ImageBuffer, Rgba};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
@@ -37,6 +39,7 @@ pub struct ViewDesktopApp {
 
 impl ViewDesktopApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        debug_log("desktop app: new()".to_string());
         configure_theme(&cc.egui_ctx);
 
         let state = Arc::new(Mutex::new(AppState::new()));
@@ -56,6 +59,7 @@ impl eframe::App for ViewDesktopApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(120));
         self.frame_count += 1;
+        debug_log(format!("frame={} entering update", self.frame_count));
 
         let mut state = self.state.blocking_lock();
         let search_buffer = &mut self.search_buffer;
@@ -63,14 +67,14 @@ impl eframe::App for ViewDesktopApp {
 
         egui::TopBottomPanel::top("header")
             .frame(
-                Frame::none()
+                Frame::new()
                     .fill(BG_PANEL_ALT)
                     .stroke(Stroke::new(1.0, ACCENT)),
             )
             .show(ctx, |ui| render_header(ui, &mut state, search_buffer));
 
         egui::TopBottomPanel::bottom("footer")
-            .frame(Frame::none().fill(BG_PANEL_ALT))
+            .frame(Frame::new().fill(BG_PANEL_ALT))
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("Tab/grid/focus").color(FG_MUTED));
@@ -95,7 +99,7 @@ impl eframe::App for ViewDesktopApp {
             });
 
         egui::CentralPanel::default()
-            .frame(Frame::none().fill(BG_APP))
+            .frame(Frame::new().fill(BG_APP))
             .show(ctx, |ui| match state.view_mode {
                 ViewMode::Grid => render_grid(ui, &mut state),
                 ViewMode::Focus => render_focus(ui, &mut state),
@@ -113,23 +117,32 @@ impl ViewDesktopApp {
         };
 
         if !self.screenshot_requested && self.frame_count >= 6 {
+            debug_log(format!("frame={} requesting screenshot", self.frame_count));
             eprintln!(
                 "desktop screenshot: requesting viewport screenshot at frame {}",
                 self.frame_count
             );
-            ctx.send_viewport_cmd(ViewportCommand::Screenshot);
+            ctx.send_viewport_cmd(ViewportCommand::Screenshot(egui::UserData::default()));
             self.screenshot_requested = true;
             return;
         }
 
         let events = ctx.input(|input| input.events.clone());
+        debug_log(format!(
+            "frame={} input_events={}",
+            self.frame_count,
+            events.len()
+        ));
         for event in events {
             if let Event::Screenshot { image, .. } = event {
+                debug_log("received screenshot event".to_string());
                 eprintln!("desktop screenshot: received screenshot event");
                 if let Err(error) = save_color_image(&path, &image) {
                     eprintln!("Failed to save desktop screenshot to {:?}: {}", path, error);
+                    debug_log(format!("failed saving screenshot: {error}"));
                 } else {
                     eprintln!("Desktop screenshot saved to {:?}", path);
+                    debug_log(format!("saved screenshot to {:?}", path));
                 }
                 ctx.send_viewport_cmd(ViewportCommand::Close);
                 break;
@@ -218,27 +231,47 @@ fn render_grid(ui: &mut egui::Ui, state: &mut AppState) {
     let page_size = columns * rows;
     let ids = state.visible_agents_page(page_size);
     let selected = state.get_selected_agent_id();
+    let spacing = 12.0;
+    let total_spacing = spacing * (columns.saturating_sub(1) as f32);
+    let tile_width = ((ui.available_width() - total_spacing).max(320.0)) / columns as f32;
+    let tile_size = Vec2::new(tile_width.max(320.0), 255.0);
 
     ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            egui::Grid::new("desktop-grid")
-                .num_columns(columns)
-                .spacing(Vec2::new(12.0, 12.0))
-                .show(ui, |ui| {
-                    for (index, id) in ids.iter().enumerate() {
-                        if let Some(agent) = state.agents.get(id).cloned() {
-                            let is_selected = selected.as_deref() == Some(id.as_str());
-                            render_tile(ui, &agent, state, is_selected, index);
-                        } else {
-                            ui.allocate_space(Vec2::new(360.0, 250.0));
-                        }
+            for row in 0..rows {
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = spacing;
 
-                        if (index + 1) % columns == 0 {
-                            ui.end_row();
-                        }
+                    for col in 0..columns {
+                        let index = row * columns + col;
+                        ui.allocate_ui_with_layout(
+                            tile_size,
+                            Layout::top_down(Align::LEFT),
+                            |ui| {
+                                if let Some(id) = ids.get(index) {
+                                    if let Some(agent) = state.agents.get(id).cloned() {
+                                        let is_selected = selected.as_deref() == Some(id.as_str());
+                                        render_tile(
+                                            ui,
+                                            &agent,
+                                            state,
+                                            is_selected,
+                                            index,
+                                            tile_size,
+                                        );
+                                    } else {
+                                        ui.allocate_space(tile_size);
+                                    }
+                                } else {
+                                    ui.allocate_space(tile_size);
+                                }
+                            },
+                        );
                     }
                 });
+                ui.add_space(spacing);
+            }
         });
 }
 
@@ -320,11 +353,11 @@ fn chip(ui: &mut egui::Ui, label: &str, color: Color32, filled: bool) {
     let text = RichText::new(label)
         .strong()
         .color(if filled { BG_APP } else { color });
-    let frame = Frame::none()
+    let frame = Frame::new()
         .fill(if filled { color } else { BG_PANEL_ALT })
         .stroke(Stroke::new(1.0, color))
-        .rounding(10.0)
-        .inner_margin(egui::Margin::symmetric(8.0, 4.0));
+        .corner_radius(10.0)
+        .inner_margin(egui::Margin::symmetric(8, 4));
     frame.show(ui, |ui| {
         ui.label(text);
     });
@@ -334,11 +367,11 @@ fn tab_chip(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
     let text = RichText::new(label)
         .strong()
         .color(if selected { BG_APP } else { FG_PRIMARY });
-    egui::Frame::none()
+    egui::Frame::new()
         .fill(if selected { ACCENT_ALT } else { BG_PANEL_ALT })
         .stroke(Stroke::new(1.0, if selected { ACCENT_ALT } else { ACCENT }))
-        .rounding(10.0)
-        .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+        .corner_radius(10.0)
+        .inner_margin(egui::Margin::symmetric(8, 4))
         .show(ui, |ui| ui.button(text))
         .inner
 }
@@ -349,6 +382,7 @@ fn render_tile(
     state: &mut AppState,
     selected: bool,
     visible_index: usize,
+    tile_size: Vec2,
 ) {
     let border = if selected { ACCENT_ALT } else { ACCENT };
     let fill = if selected { BG_PANEL } else { BG_PANEL_ALT };
@@ -365,13 +399,13 @@ fn render_tile(
         .cloned()
         .unwrap_or_else(|| "idle".to_string());
 
-    let response = Frame::none()
+    let response = Frame::new()
         .fill(fill)
         .stroke(Stroke::new(if selected { 2.0 } else { 1.0 }, border))
-        .rounding(12.0)
-        .inner_margin(egui::Margin::same(12.0))
+        .corner_radius(12.0)
+        .inner_margin(egui::Margin::same(12))
         .show(ui, |ui| {
-            ui.set_min_size(Vec2::new(360.0, 255.0));
+            ui.set_min_size(tile_size);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("●").color(status).size(16.0));
                 ui.label(RichText::new(&agent.id).strong().size(18.0));
@@ -454,11 +488,11 @@ fn render_tile(
 }
 
 fn render_focus_detail(ui: &mut egui::Ui, agent: &Agent, state: &AppState) {
-    Frame::none()
+    Frame::new()
         .fill(BG_PANEL_ALT)
         .stroke(Stroke::new(1.0, ACCENT))
-        .rounding(12.0)
-        .inner_margin(egui::Margin::same(14.0))
+        .corner_radius(12.0)
+        .inner_margin(egui::Margin::same(14))
         .show(ui, |ui| {
             ui.label(RichText::new(&agent.id).strong().size(22.0));
             ui.label(RichText::new(format!("{} · {}", agent.project, agent.role)).color(FG_MUTED));
@@ -620,6 +654,22 @@ fn screenshot_target() -> Option<PathBuf> {
         .or_else(|_| std::env::var("EFRAME_SCREENSHOT_TO"))
         .ok()
         .map(PathBuf::from)
+}
+
+fn debug_log_path() -> Option<PathBuf> {
+    std::env::var("VIEW_DESKTOP_DEBUG_LOG")
+        .ok()
+        .map(PathBuf::from)
+}
+
+fn debug_log(message: String) {
+    let Some(path) = debug_log_path() else {
+        return;
+    };
+
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{message}");
+    }
 }
 
 fn save_color_image(path: &PathBuf, image: &egui::ColorImage) -> anyhow::Result<()> {
