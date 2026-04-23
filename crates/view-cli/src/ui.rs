@@ -1140,7 +1140,7 @@ mod tests {
         beta.project = "wasp".to_string();
         app.update_agent(alpha);
         app.update_agent(beta);
-        app.view_mode = ViewMode::Grid;
+        app.ui.view_mode = ViewMode::Grid;
 
         let backend = TestBackend::new(140, 30);
         let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -1169,7 +1169,7 @@ mod tests {
         beta.id = "workspace-2".to_string();
         app.update_agent(alpha);
         app.update_agent(beta);
-        app.view_mode = ViewMode::Grid;
+        app.ui.view_mode = ViewMode::Grid;
 
         let backend = TestBackend::new(160, 32);
         let mut terminal = Terminal::new(backend).expect("test terminal");

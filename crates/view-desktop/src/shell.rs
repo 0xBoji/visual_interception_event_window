@@ -84,6 +84,26 @@ pub fn history_entry_for_offset(
     history.iter().rev().nth(history_offset - 1).cloned()
 }
 
+fn cd_directory_suggestion(cwd: &str, input: &str) -> Option<String> {
+    let prefix = input.strip_prefix("cd ")?;
+    if prefix.is_empty() || prefix.contains(' ') || prefix.contains('\'') || prefix.contains('"') {
+        return None;
+    }
+
+    let path = Path::new(cwd);
+    let mut matches = std::fs::read_dir(path)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_dir()))
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with(prefix))
+        .collect::<Vec<_>>();
+
+    matches.sort_unstable();
+    let first = matches.into_iter().next()?;
+    Some(format!("cd {first}"))
+}
+
 // ── Directory picker ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +152,60 @@ pub fn directory_picker_options(cwd: &str, query: &str) -> Vec<DirectoryOption> 
     }
 
     options
+}
+
+// ── Branch picker ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchOption {
+    pub label: String,
+    pub is_current: bool,
+}
+
+pub fn branch_picker_options(cwd: &str, query: &str) -> Vec<BranchOption> {
+    let query = query.trim().to_lowercase();
+    let current_branch = git_prompt_details(cwd).map(|(branch, _)| branch);
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .arg("for-each-ref")
+        .arg("--format=%(refname:short)")
+        .arg("refs/heads")
+        .output();
+
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    let mut branches = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .filter(|label| query.is_empty() || label.to_lowercase().contains(&query))
+        .collect::<Vec<_>>();
+
+    branches.sort_unstable_by_key(|label| label.to_lowercase());
+    if let Some(current) = current_branch.as_ref() {
+        if let Some(index) = branches.iter().position(|branch| branch == current) {
+            let current_branch = branches.remove(index);
+            branches.insert(0, current_branch);
+        }
+    }
+
+    branches
+        .into_iter()
+        .map(|label| BranchOption {
+            is_current: current_branch
+                .as_ref()
+                .is_some_and(|current| current == &label),
+            label,
+        })
+        .collect()
 }
 
 // ── Command submission ─────────────────────────────────────────────────────────
@@ -188,4 +262,21 @@ pub fn terminal_suggestion_suffix(input: &str, suggestion: Option<&str>) -> Opti
         return None;
     }
     suggestion.strip_prefix(input).map(ToOwned::to_owned)
+}
+
+pub fn command_suggestion(
+    cwd: &str,
+    history: &std::collections::VecDeque<String>,
+    input: &str,
+) -> Option<String> {
+    cd_directory_suggestion(cwd, input).or_else(|| {
+        if input.is_empty() {
+            return None;
+        }
+        history
+            .iter()
+            .rev()
+            .find(|cmd| cmd.starts_with(input))
+            .cloned()
+    })
 }

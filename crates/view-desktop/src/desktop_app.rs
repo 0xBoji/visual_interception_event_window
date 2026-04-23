@@ -1,14 +1,17 @@
+use eframe::egui::text_selection::LabelSelectionState;
 use eframe::egui::{
-    self, Align, Color32, Event, Frame, Key, Layout, RichText, ScrollArea, Stroke, ViewportCommand,
+    self, Align, Color32, Event, Frame, Key, Layout, PointerButton, RichText, ScrollArea, Stroke,
+    ViewportCommand,
 };
 use image::{ImageBuffer, Rgba};
 use parking_lot::RwLock;
+use std::collections::BTreeSet;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::runtime::Builder;
 use tokio::sync::mpsc;
 use view_core::{
@@ -21,7 +24,6 @@ use crate::{
     transcript::{
         command_block_has_error, is_command_context_line, is_context_block_start,
         is_error_output_line, is_legacy_context_block_start, should_extend_error_block_to_bottom,
-        should_render_block_separator,
     },
 };
 
@@ -33,8 +35,16 @@ const FG_MUTED: Color32 = Color32::from_rgb(145, 154, 188);
 const ACCENT: Color32 = Color32::from_rgb(108, 92, 231);
 const ACCENT_ALT: Color32 = Color32::from_rgb(76, 201, 240);
 const PICKER_HOVER: Color32 = Color32::from_rgb(46, 167, 208);
+const BRANCH_GREEN: Color32 = Color32::from_rgb(198, 242, 158);
+const BRANCH_GREEN_BORDER: Color32 = Color32::from_rgb(106, 153, 78);
 const ERROR_PANEL_BG: Color32 = Color32::from_rgb(96, 40, 40);
 const ERROR_TEXT: Color32 = Color32::from_rgb(255, 228, 228);
+const PATH_BLUE: Color32 = Color32::from_rgb(157, 175, 235);
+const COMMAND_CYAN: Color32 = Color32::from_rgb(104, 214, 255);
+const DIRECTORY_PURPLE: Color32 = Color32::from_rgb(176, 162, 255);
+const POSITIVE_GREEN: Color32 = Color32::from_rgb(114, 229, 121);
+const NEGATIVE_RED: Color32 = Color32::from_rgb(255, 132, 116);
+const SELECTED_PANEL_BG: Color32 = Color32::from_rgb(30, 41, 59);
 
 pub struct ViewDesktopApp {
     state: Arc<RwLock<AppState>>,
@@ -42,10 +52,15 @@ pub struct ViewDesktopApp {
     history_offset: usize,
     directory_picker_open: bool,
     directory_picker_query: String,
+    branch_picker_open: bool,
+    branch_picker_query: String,
     action_tx: mpsc::UnboundedSender<Action>,
     frame_count: u64,
     screenshot_requested: bool,
     screenshot_target: Option<PathBuf>,
+    copied_badge_until: Option<Instant>,
+    selection_drag_origin: Option<egui::Pos2>,
+    selected_transcript_blocks: BTreeSet<usize>,
 }
 
 impl ViewDesktopApp {
@@ -62,10 +77,15 @@ impl ViewDesktopApp {
             history_offset: 0,
             directory_picker_open: false,
             directory_picker_query: String::new(),
+            branch_picker_open: false,
+            branch_picker_query: String::new(),
             action_tx,
             frame_count: 0,
             screenshot_requested: false,
             screenshot_target: screenshot_target(),
+            copied_badge_until: None,
+            selection_drag_origin: None,
+            selected_transcript_blocks: BTreeSet::new(),
         }
     }
 }
@@ -84,6 +104,10 @@ fn shell_quote_path(path: &str) -> String {
 
 fn directory_picker_options(cwd: &str, query: &str) -> Vec<shell::DirectoryOption> {
     shell::directory_picker_options(cwd, query)
+}
+
+fn branch_picker_options(cwd: &str, query: &str) -> Vec<shell::BranchOption> {
+    shell::branch_picker_options(cwd, query)
 }
 
 fn submit_shell_command(
@@ -109,28 +133,280 @@ fn draw_divider(ui: &mut egui::Ui, color: Color32) {
         .hline(rect.x_range(), rect.center().y, Stroke::new(1.0, color));
 }
 
+fn show_button_tooltip(ctx: &egui::Context, id: &'static str, rect: egui::Rect, text: &str) {
+    let pos = egui::pos2(rect.min.x, rect.min.y - 40.0);
+    egui::Area::new(egui::Id::new(id))
+        .order(egui::Order::Foreground)
+        .fixed_pos(pos)
+        .show(ctx, |ui| {
+            Frame::new()
+                .fill(Color32::from_gray(185))
+                .stroke(Stroke::new(1.0, Color32::from_gray(195)))
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.label(RichText::new(text).color(BG_APP).size(11.5));
+                });
+        });
+}
+
+fn render_copied_badge(ctx: &egui::Context) {
+    egui::Area::new(egui::Id::new("copied_badge"))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::RIGHT_BOTTOM, [-18.0, -18.0])
+        .show(ctx, |ui| {
+            Frame::new()
+                .fill(Color32::from_rgb(146, 102, 245))
+                .stroke(Stroke::NONE)
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new("Copied")
+                            .color(Color32::from_rgb(244, 238, 255))
+                            .size(13.0)
+                            .monospace(),
+                    );
+                });
+        });
+}
+
+fn draw_branch_icon(painter: &egui::Painter, left: f32, center_y: f32, color: Color32) {
+    let stroke = Stroke::new(1.4, color);
+    let top = egui::pos2(left + 3.0, center_y - 5.0);
+    let mid = egui::pos2(left + 3.0, center_y + 0.5);
+    let right = egui::pos2(left + 8.5, center_y - 1.5);
+    let bottom = egui::pos2(left + 3.0, center_y + 5.0);
+
+    painter.line_segment([top, mid], stroke);
+    painter.line_segment([mid, right], stroke);
+    painter.line_segment([mid, bottom], stroke);
+    painter.circle_stroke(top, 1.9, stroke);
+    painter.circle_stroke(right, 1.9, stroke);
+    painter.circle_stroke(bottom, 1.9, stroke);
+}
+
+fn picker_height(option_count: usize, row_height: f32, max_visible_rows: usize) -> f32 {
+    let visible_rows = option_count.max(1).min(max_visible_rows) as f32;
+    52.0 + (visible_rows * row_height)
+}
+
+fn update_selected_blocks(selected: &mut BTreeSet<usize>, clicked: usize, extend_selection: bool) {
+    if extend_selection {
+        if !selected.insert(clicked) {
+            selected.remove(&clicked);
+        }
+        return;
+    }
+
+    if selected.len() == 1 && selected.contains(&clicked) {
+        selected.clear();
+    } else {
+        selected.clear();
+        selected.insert(clicked);
+    }
+}
+
+fn mono_text_format(color: Color32, strong: bool) -> egui::TextFormat {
+    egui::TextFormat {
+        font_id: if strong {
+            egui::FontId::new(13.0, egui::FontFamily::Monospace)
+        } else {
+            egui::FontId::monospace(13.0)
+        },
+        color,
+        ..Default::default()
+    }
+}
+
+fn append_token(job: &mut egui::text::LayoutJob, text: &str, color: Color32, strong: bool) {
+    job.append(text, 0.0, mono_text_format(color, strong));
+}
+
+fn append_preserving_whitespace(
+    job: &mut egui::text::LayoutJob,
+    line: &str,
+    color_fn: impl Fn(&str) -> Color32,
+    strong_fn: impl Fn(&str) -> bool,
+) {
+    let mut current = String::new();
+    let mut in_whitespace = None;
+    for ch in line.chars() {
+        let is_ws = ch.is_whitespace();
+        if in_whitespace == Some(is_ws) || in_whitespace.is_none() {
+            current.push(ch);
+            in_whitespace = Some(is_ws);
+            continue;
+        }
+
+        let color = if in_whitespace == Some(true) {
+            FG_PRIMARY
+        } else {
+            color_fn(&current)
+        };
+        append_token(job, &current, color, strong_fn(&current));
+        current.clear();
+        current.push(ch);
+        in_whitespace = Some(is_ws);
+    }
+
+    if !current.is_empty() {
+        let color = if in_whitespace == Some(true) {
+            FG_PRIMARY
+        } else {
+            color_fn(&current)
+        };
+        append_token(job, &current, color, strong_fn(&current));
+    }
+}
+
+fn context_line_job(line: &str) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    append_preserving_whitespace(
+        &mut job,
+        line,
+        |token| {
+            if token.starts_with('/') {
+                PATH_BLUE
+            } else if token.starts_with("git:(") {
+                BRANCH_GREEN
+            } else if token.starts_with('+') {
+                POSITIVE_GREEN
+            } else if token.starts_with('-') {
+                NEGATIVE_RED
+            } else if token.starts_with('(') && token.ends_with(')') {
+                FG_MUTED
+            } else {
+                FG_MUTED
+            }
+        },
+        |_| false,
+    );
+    job
+}
+
+fn command_line_job(line: &str, has_error: bool) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    append_token(
+        &mut job,
+        "$ ",
+        if has_error { ERROR_TEXT } else { FG_PRIMARY },
+        true,
+    );
+    let command = line.strip_prefix("$ ").unwrap_or(line);
+    append_preserving_whitespace(
+        &mut job,
+        command,
+        |token| {
+            if token == "git" || token == "cd" || token == "ls" {
+                COMMAND_CYAN
+            } else if token.starts_with('/') || token.starts_with('.') || token.contains('/') {
+                DIRECTORY_PURPLE
+            } else if token.starts_with('-') {
+                FG_MUTED
+            } else {
+                if has_error {
+                    ERROR_TEXT
+                } else {
+                    FG_PRIMARY
+                }
+            }
+        },
+        |token| token == "git" || token == "cd" || token == "ls",
+    );
+    job
+}
+
+fn output_line_job(line: &str, cwd: &str) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    append_preserving_whitespace(
+        &mut job,
+        line,
+        |token| {
+            if is_error_output_line(token) || is_error_output_line(line) {
+                ERROR_TEXT
+            } else if token == "." || token == ".." {
+                DIRECTORY_PURPLE
+            } else if Path::new(cwd).join(token).is_dir() {
+                DIRECTORY_PURPLE
+            } else {
+                FG_PRIMARY
+            }
+        },
+        |_| false,
+    );
+    job
+}
+
 impl eframe::App for ViewDesktopApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(120));
         self.frame_count += 1;
         debug_log(format!("frame={} entering update", self.frame_count));
 
+        if ctx.input(|input| input.pointer.any_pressed()) {
+            self.selection_drag_origin = ctx.input(|input| input.pointer.press_origin());
+        }
+
+        let dragged_far_enough = ctx.input(|input| {
+            let Some(origin) = self.selection_drag_origin else {
+                return false;
+            };
+            let Some(current) = input.pointer.interact_pos() else {
+                return false;
+            };
+            origin.distance(current) > 6.0
+        });
+        let clicked_word_or_line = ctx.input(|input| {
+            input.pointer.button_double_clicked(PointerButton::Primary)
+                || input.pointer.button_triple_clicked(PointerButton::Primary)
+        });
+        let should_copy_selection = ctx.input(|input| input.pointer.any_released())
+            && (dragged_far_enough || clicked_word_or_line)
+            && ctx.plugin::<LabelSelectionState>().lock().has_selection();
+        if should_copy_selection {
+            ctx.input_mut(|input| input.events.push(Event::Copy));
+            self.copied_badge_until = Some(Instant::now() + Duration::from_secs_f32(1.2));
+        }
+        if ctx.input(|input| input.pointer.any_released()) {
+            self.selection_drag_origin = None;
+        }
+
         let mut state = self.state.write();
         shortcuts::handle(ctx, &mut state);
 
         egui::CentralPanel::default()
-            .frame(Frame::new().fill(BG_APP))
+            .frame(Frame::new().fill(BG_APP).inner_margin(0.0))
             .show(ctx, |ui| {
                 render_focus(
                     ui,
                     &mut state,
                     &mut self.shell_input,
                     &mut self.history_offset,
+                    &mut self.selected_transcript_blocks,
                     &mut self.directory_picker_open,
                     &mut self.directory_picker_query,
+                    &mut self.branch_picker_open,
+                    &mut self.branch_picker_query,
                     &self.action_tx,
                 )
             });
+
+        let copied_this_frame = ctx.output(|output| {
+            output
+                .commands
+                .iter()
+                .any(|command| matches!(command, egui::OutputCommand::CopyText(_)))
+        });
+        if copied_this_frame {
+            self.copied_badge_until = Some(Instant::now() + Duration::from_secs_f32(1.2));
+        }
+        if self
+            .copied_badge_until
+            .is_some_and(|until| Instant::now() < until)
+        {
+            render_copied_badge(ctx);
+        }
 
         // Force disable IME to prevent macOS Vietnamese Telex from intercepting
         // terminal inputs, showing blue composing highlights, and eating spaces.
@@ -187,8 +463,11 @@ fn render_focus(
     state: &mut AppState,
     shell_input: &mut String,
     history_offset: &mut usize,
+    selected_transcript_blocks: &mut BTreeSet<usize>,
     directory_picker_open: &mut bool,
     directory_picker_query: &mut String,
+    branch_picker_open: &mut bool,
+    branch_picker_query: &mut String,
     action_tx: &mpsc::UnboundedSender<Action>,
 ) {
     if let Some(session) = state.selected_terminal().cloned() {
@@ -198,8 +477,11 @@ fn render_focus(
             state,
             shell_input,
             history_offset,
+            selected_transcript_blocks,
             directory_picker_open,
             directory_picker_query,
+            branch_picker_open,
+            branch_picker_query,
             action_tx,
         );
     } else {
@@ -257,11 +539,14 @@ fn render_focus_terminal(
     state: &mut AppState,
     shell_input: &mut String,
     history_offset: &mut usize,
+    selected_transcript_blocks: &mut BTreeSet<usize>,
     directory_picker_open: &mut bool,
     directory_picker_query: &mut String,
+    branch_picker_open: &mut bool,
+    branch_picker_query: &mut String,
     action_tx: &mpsc::UnboundedSender<Action>,
 ) {
-    ui.add_space(14.0);
+    ui.add_space(4.0);
     ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
 
@@ -274,7 +559,7 @@ fn render_focus_terminal(
             );
         });
 
-        ui.add_space(10.0);
+        ui.add_space(4.0);
         ui.separator();
 
         let transcript_height = (ui.available_height() - 110.0).max(180.0);
@@ -299,7 +584,7 @@ fn render_focus_terminal(
                 }
 
                 let mut index = 0usize;
-                let mut previous_block_had_error = false;
+                let mut block_index = 0usize;
                 while index < lines.len() {
                     let line = lines[index];
                     let has_context_line = is_context_block_start(&lines, index);
@@ -316,11 +601,7 @@ fn render_focus_terminal(
                         }
 
                         let has_error = command_block_has_error(&lines, prompt_index);
-                        if should_render_block_separator(previous_block_had_error, has_error) {
-                            ui.add_space(8.0);
-                            ui.separator();
-                            ui.add_space(8.0);
-                        }
+                        let is_selected = selected_transcript_blocks.contains(&block_index);
 
                         let block_width = ui.available_width();
                         let extend_error_block_to_bottom = should_extend_error_block_to_bottom(
@@ -332,50 +613,62 @@ fn render_focus_terminal(
                         } else {
                             0.0
                         };
-                        Frame::new()
-                            .fill(if has_error {
-                                ERROR_PANEL_BG
-                            } else {
-                                Color32::TRANSPARENT
-                            })
-                            .corner_radius(if has_error { 0.0 } else { 8.0 })
-                            .inner_margin(egui::Margin::symmetric(
-                                10,
-                                if has_error { 16 } else { 8 },
-                            ))
-                            .show(ui, |ui| {
-                                ui.set_min_width((block_width - 20.0).max(0.0));
-                                if extend_error_block_to_bottom {
-                                    ui.set_min_height(block_height);
-                                }
-                                for block_line in &lines[block_start..block_end] {
-                                    let mut color = FG_PRIMARY;
-                                    let mut is_bold = false;
 
-                                    if is_command_context_line(block_line) {
-                                        color = FG_MUTED;
-                                    } else if block_line.starts_with("$ ") {
-                                        color = if has_error {
-                                            ERROR_TEXT
-                                        } else {
-                                            Color32::WHITE
-                                        };
-                                        is_bold = true;
-                                    } else if block_line.starts_with("~ (") {
-                                        color = FG_MUTED;
-                                    } else if is_error_output_line(block_line) {
-                                        color = ERROR_TEXT;
-                                    }
+                        let fill_color = if has_error {
+                            ERROR_PANEL_BG
+                        } else if is_selected {
+                            SELECTED_PANEL_BG
+                        } else {
+                            Color32::TRANSPARENT
+                        };
 
-                                    ui.label(if is_bold {
-                                        RichText::new(*block_line).monospace().color(color).strong()
-                                    } else {
-                                        RichText::new(*block_line).monospace().color(color)
-                                    });
-                                }
+                        let frame = Frame::new()
+                            .fill(fill_color)
+                            .stroke(Stroke::NONE)
+                            .corner_radius(0.0)
+                            .inner_margin(egui::Margin {
+                                left: 14,
+                                right: 14,
+                                top: 0,
+                                bottom: 0,
                             });
 
-                        previous_block_had_error = has_error;
+                        let frame_response = frame.show(ui, |ui| {
+                            ui.set_min_width(block_width);
+                            if extend_error_block_to_bottom {
+                                ui.set_min_height(block_height);
+                            }
+                            for block_line in &lines[block_start..block_end] {
+                                let job = if is_command_context_line(block_line) {
+                                    context_line_job(block_line)
+                                } else if block_line.starts_with("$ ") {
+                                    command_line_job(block_line, has_error)
+                                } else if block_line.starts_with("~ (") {
+                                    let mut job = egui::text::LayoutJob::default();
+                                    append_token(&mut job, block_line, FG_MUTED, false);
+                                    job
+                                } else {
+                                    output_line_job(block_line, &session.cwd)
+                                };
+                                ui.label(job);
+                            }
+                        });
+
+                        let click_response = ui.interact(
+                            frame_response.response.rect,
+                            ui.make_persistent_id(("transcript_block", block_index)),
+                            egui::Sense::click(),
+                        );
+
+                        if click_response.clicked() {
+                            update_selected_blocks(
+                                selected_transcript_blocks,
+                                block_index,
+                                ui.input(|input| input.modifiers.shift),
+                            );
+                        }
+
+                        block_index += 1;
                         index = block_end;
                         while index < lines.len() && lines[index].trim().is_empty() {
                             index += 1;
@@ -383,19 +676,17 @@ fn render_focus_terminal(
                         continue;
                     }
 
-                    let color = if line.starts_with("~ (") {
-                        FG_MUTED
-                    } else if is_error_output_line(line) {
-                        Color32::from_rgb(255, 205, 205)
-                    } else {
-                        FG_PRIMARY
-                    };
-
                     ui.horizontal(|ui| {
                         ui.add_space(14.0);
-                        ui.label(RichText::new(line).monospace().color(color));
+                        let job = if line.starts_with("~ (") {
+                            let mut job = egui::text::LayoutJob::default();
+                            append_token(&mut job, line, FG_MUTED, false);
+                            job
+                        } else {
+                            output_line_job(line, &session.cwd)
+                        };
+                        ui.label(job);
                     });
-                    previous_block_had_error = false;
                     index += 1;
                 }
             });
@@ -408,6 +699,10 @@ fn render_focus_terminal(
             ui.add_space(12.0);
         }
 
+        let mut directory_button_rect = None;
+        let mut branch_button_rect = None;
+        let mut directory_button_hovered = false;
+        let mut branch_button_hovered = false;
         ui.horizontal(|ui| {
             ui.add_space(14.0);
             let short_cwd = truncate_path(&session.cwd, 40);
@@ -421,11 +716,59 @@ fn render_focus_terminal(
             .corner_radius(6.0)
             .fill(BG_PANEL_ALT)
             .min_size(egui::vec2(0.0, 28.0));
-            if ui.add(directory_button).clicked() {
+            let directory_response = ui.add(directory_button);
+            directory_button_rect = Some(directory_response.rect);
+            directory_button_hovered = directory_response.hovered();
+            if directory_response.clicked() {
                 *directory_picker_open = true;
+                *branch_picker_open = false;
                 directory_picker_query.clear();
             }
+
+            if let Some((branch, _)) = shell::git_prompt_details(&session.cwd) {
+                ui.add_space(10.0);
+                let branch_button = egui::Button::new(
+                    RichText::new(format!("   {}", branch))
+                        .color(BRANCH_GREEN)
+                        .size(13.0)
+                        .monospace(),
+                )
+                .stroke(Stroke::new(1.0, BRANCH_GREEN_BORDER))
+                .corner_radius(6.0)
+                .fill(BG_PANEL)
+                .min_size(egui::vec2(0.0, 26.0));
+                let response = ui.add(branch_button);
+                branch_button_rect = Some(response.rect);
+                branch_button_hovered = response.hovered();
+                draw_branch_icon(
+                    ui.painter(),
+                    response.rect.min.x + 8.0,
+                    response.rect.center().y,
+                    BRANCH_GREEN,
+                );
+                if response.clicked() {
+                    *branch_picker_open = true;
+                    *directory_picker_open = false;
+                    branch_picker_query.clear();
+                }
+            }
         });
+
+        if directory_button_hovered {
+            if let Some(rect) = directory_button_rect {
+                show_button_tooltip(
+                    ui.ctx(),
+                    "directory_button_tooltip",
+                    rect,
+                    "Change working directory",
+                );
+            }
+        }
+        if branch_button_hovered {
+            if let Some(rect) = branch_button_rect {
+                show_button_tooltip(ui.ctx(), "branch_button_tooltip", rect, "Change git branch");
+            }
+        }
 
         if *directory_picker_open {
             let mut close_picker = false;
@@ -433,11 +776,17 @@ fn render_focus_terminal(
                 close_picker = true;
             }
 
-            egui::Window::new("directory_picker")
+            let directory_options = directory_picker_options(&session.cwd, directory_picker_query);
+            let directory_picker_size =
+                egui::vec2(400.0, picker_height(directory_options.len(), 28.0, 8));
+            let directory_picker_pos = directory_button_rect
+                .map(|rect| egui::pos2(rect.min.x, rect.min.y - directory_picker_size.y - 16.0))
+                .unwrap_or_else(|| egui::pos2(14.0, 0.0));
+            let directory_popup_rect = egui::Window::new("directory_picker")
                 .title_bar(false)
                 .resizable(false)
-                .fixed_size(egui::vec2(400.0, 332.0))
-                .anchor(egui::Align2::LEFT_BOTTOM, [14.0, -72.0])
+                .fixed_size(directory_picker_size)
+                .fixed_pos(directory_picker_pos)
                 .show(ui.ctx(), |ui| {
                     let search_id = ui.make_persistent_id("directory_picker_search");
                     let search = Frame::new()
@@ -458,59 +807,184 @@ fn render_focus_terminal(
                         search.request_focus();
                     }
 
-                    ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                        for option in directory_picker_options(&session.cwd, directory_picker_query)
-                        {
-                            let prefix = if option.is_parent { "↑" } else { "🗀" };
-                            let (rect, response) = ui.allocate_exact_size(
-                                egui::vec2(ui.available_width(), 28.0),
-                                egui::Sense::click(),
-                            );
-                            if response.hovered() {
-                                ui.painter().rect_filled(rect, 0.0, PICKER_HOVER);
-                            }
+                    ScrollArea::vertical()
+                        .max_height(directory_picker_size.y - 52.0)
+                        .show(ui, |ui| {
+                            for option in &directory_options {
+                                let prefix = if option.is_parent { "↑" } else { "🗀" };
+                                let (rect, response) = ui.allocate_exact_size(
+                                    egui::vec2(ui.available_width(), 28.0),
+                                    egui::Sense::click(),
+                                );
+                                if response.hovered() {
+                                    ui.painter().rect_filled(rect, 0.0, PICKER_HOVER);
+                                }
 
-                            let text_color = if response.hovered() {
-                                BG_APP
-                            } else if option.is_parent {
-                                FG_MUTED
-                            } else {
-                                FG_PRIMARY
-                            };
-                            ui.painter().text(
-                                egui::pos2(rect.min.x + 10.0, rect.center().y),
-                                egui::Align2::LEFT_CENTER,
-                                prefix,
-                                egui::FontId::monospace(13.0),
-                                text_color,
-                            );
-                            ui.painter().text(
-                                egui::pos2(rect.min.x + 34.0, rect.center().y),
-                                egui::Align2::LEFT_CENTER,
-                                &option.label,
-                                egui::FontId::monospace(12.0),
-                                text_color,
-                            );
+                                let text_color = if response.hovered() {
+                                    BG_APP
+                                } else if option.is_parent {
+                                    FG_MUTED
+                                } else {
+                                    FG_PRIMARY
+                                };
+                                ui.painter().text(
+                                    egui::pos2(rect.min.x + 10.0, rect.center().y),
+                                    egui::Align2::LEFT_CENTER,
+                                    prefix,
+                                    egui::FontId::monospace(13.0),
+                                    text_color,
+                                );
+                                ui.painter().text(
+                                    egui::pos2(rect.min.x + 34.0, rect.center().y),
+                                    egui::Align2::LEFT_CENTER,
+                                    &option.label,
+                                    egui::FontId::monospace(12.0),
+                                    text_color,
+                                );
 
-                            if response.clicked() {
-                                let command =
-                                    format!("cd {}", shell_quote_path(&option.target_path));
-                                if submit_shell_command(
-                                    state,
-                                    action_tx.clone(),
-                                    history_offset,
-                                    command,
-                                ) {
-                                    shell_input.clear();
-                                    close_picker = true;
+                                if response.clicked() {
+                                    let command =
+                                        format!("cd {}", shell_quote_path(&option.target_path));
+                                    if submit_shell_command(
+                                        state,
+                                        action_tx.clone(),
+                                        history_offset,
+                                        command,
+                                    ) {
+                                        shell_input.clear();
+                                        close_picker = true;
+                                    }
                                 }
                             }
-                        }
-                    });
-                });
+                        });
+                })
+                .map(|inner| inner.response.rect);
+            if ui.ctx().input(|input| input.pointer.any_pressed()) {
+                if let Some(pointer_pos) = ui.ctx().input(|input| input.pointer.interact_pos()) {
+                    let clicked_directory_button =
+                        directory_button_rect.is_some_and(|rect| rect.contains(pointer_pos));
+                    let clicked_popup =
+                        directory_popup_rect.is_some_and(|rect| rect.contains(pointer_pos));
+                    if !clicked_directory_button && !clicked_popup {
+                        close_picker = true;
+                    }
+                }
+            }
             if close_picker {
                 *directory_picker_open = false;
                 directory_picker_query.clear();
+            }
+        }
+
+        if *branch_picker_open {
+            let mut close_picker = false;
+            if ui.ctx().input(|input| input.key_pressed(Key::Escape)) {
+                close_picker = true;
+            }
+
+            let branch_options = branch_picker_options(&session.cwd, branch_picker_query);
+            let branch_picker_pos = branch_button_rect
+                .map(|rect| {
+                    let size = egui::vec2(360.0, picker_height(branch_options.len(), 28.0, 6));
+                    egui::pos2(rect.min.x, rect.min.y - size.y - 16.0)
+                })
+                .unwrap_or_else(|| egui::pos2(448.0, 0.0));
+            let branch_picker_size =
+                egui::vec2(360.0, picker_height(branch_options.len(), 28.0, 6));
+            let branch_popup_rect = egui::Window::new("branch_picker")
+                .title_bar(false)
+                .resizable(false)
+                .fixed_size(branch_picker_size)
+                .fixed_pos(branch_picker_pos)
+                .show(ui.ctx(), |ui| {
+                    let search_id = ui.make_persistent_id("branch_picker_search");
+                    let search = Frame::new()
+                        .fill(BG_APP)
+                        .stroke(Stroke::NONE)
+                        .inner_margin(egui::Margin::symmetric(10, 8))
+                        .show(ui, |ui| {
+                            ui.add_sized(
+                                [ui.available_width(), 28.0],
+                                egui::TextEdit::singleline(branch_picker_query)
+                                    .id(search_id)
+                                    .hint_text("Search branches...")
+                                    .frame(false),
+                            )
+                        })
+                        .inner;
+                    if !search.has_focus() {
+                        search.request_focus();
+                    }
+
+                    ScrollArea::vertical()
+                        .max_height(branch_picker_size.y - 52.0)
+                        .show(ui, |ui| {
+                            for option in &branch_options {
+                                let (rect, response) = ui.allocate_exact_size(
+                                    egui::vec2(ui.available_width(), 28.0),
+                                    egui::Sense::click(),
+                                );
+                                if response.hovered() {
+                                    ui.painter().rect_filled(rect, 0.0, PICKER_HOVER);
+                                }
+
+                                let text_color = if response.hovered() {
+                                    BG_APP
+                                } else {
+                                    FG_PRIMARY
+                                };
+                                draw_branch_icon(
+                                    ui.painter(),
+                                    rect.min.x + 10.0,
+                                    rect.center().y,
+                                    if response.hovered() {
+                                        BG_APP
+                                    } else {
+                                        BRANCH_GREEN
+                                    },
+                                );
+                                ui.painter().text(
+                                    egui::pos2(rect.min.x + 38.0, rect.center().y),
+                                    egui::Align2::LEFT_CENTER,
+                                    &option.label,
+                                    egui::FontId::monospace(12.0),
+                                    if option.is_current && !response.hovered() {
+                                        BRANCH_GREEN
+                                    } else {
+                                        text_color
+                                    },
+                                );
+
+                                if response.clicked() {
+                                    let command = format!("git checkout {}", option.label);
+                                    if submit_shell_command(
+                                        state,
+                                        action_tx.clone(),
+                                        history_offset,
+                                        command,
+                                    ) {
+                                        shell_input.clear();
+                                        close_picker = true;
+                                    }
+                                }
+                            }
+                        });
+                })
+                .map(|inner| inner.response.rect);
+            if ui.ctx().input(|input| input.pointer.any_pressed()) {
+                if let Some(pointer_pos) = ui.ctx().input(|input| input.pointer.interact_pos()) {
+                    let clicked_branch_button =
+                        branch_button_rect.is_some_and(|rect| rect.contains(pointer_pos));
+                    let clicked_popup =
+                        branch_popup_rect.is_some_and(|rect| rect.contains(pointer_pos));
+                    if !clicked_branch_button && !clicked_popup {
+                        close_picker = true;
+                    }
+                }
+            }
+            if close_picker {
+                *branch_picker_open = false;
+                branch_picker_query.clear();
             }
         }
 
@@ -522,8 +996,12 @@ fn render_focus_terminal(
         rect.set_height(24.0);
         rect.min.x += 14.0;
 
-        let suggestion = state.get_terminal_suggestion(state.ui.selected_terminal_idx, shell_input);
+        let suggestion = shell::command_suggestion(&session.cwd, &session.history, shell_input);
         let suggestion_suffix = terminal_suggestion_suffix(shell_input, suggestion.as_deref());
+        let completion_requested = !*directory_picker_open
+            && !*branch_picker_open
+            && (ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Tab))
+                || ui.input(|i| i.key_pressed(Key::ArrowRight)));
 
         if shell_input.is_empty() {
             let mut placeholder_rect = rect;
@@ -580,6 +1058,7 @@ fn render_focus_terminal(
                 .id(input_id)
                 .frame(false)
                 .margin(egui::Margin::symmetric(14, 0))
+                .lock_focus(true)
                 .font(egui::TextStyle::Monospace),
         );
 
@@ -623,11 +1102,9 @@ fn render_focus_terminal(
         }
 
         if let Some(sugg) = suggestion {
-            if response.has_focus()
-                && (ui.input(|i| i.key_pressed(Key::Tab))
-                    || ui.input(|i| i.key_pressed(Key::ArrowRight)))
-            {
+            if completion_requested {
                 *shell_input = sugg;
+                ui.memory_mut(|memory| memory.request_focus(input_id));
                 if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), input_id) {
                     let ccursor = egui::text::CCursor::new(shell_input.chars().count());
                     state
@@ -638,17 +1115,21 @@ fn render_focus_terminal(
             }
         }
 
-        if !*directory_picker_open && !response.has_focus() && shell_input.is_empty() {
+        if !*directory_picker_open
+            && !*branch_picker_open
+            && !response.has_focus()
+            && shell_input.is_empty()
+        {
             ui.memory_mut(|memory| memory.request_focus(input_id));
         }
-        if response.lost_focus()
-            && ui.input(|input| input.key_pressed(Key::Enter))
-            && !shell_input.trim().is_empty()
-        {
+        let submit_requested = !*directory_picker_open
+            && !*branch_picker_open
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Enter));
+        if submit_requested && !shell_input.trim().is_empty() {
             let command = shell_input.trim().to_string();
             if submit_shell_command(state, action_tx.clone(), history_offset, command) {
                 shell_input.clear();
-                ui.memory_mut(|memory| memory.request_focus(input_id));
+                response.request_focus();
             }
         }
     });
@@ -736,10 +1217,15 @@ fn save_color_image(path: &PathBuf, image: &egui::ColorImage) -> anyhow::Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{screenshot_target, terminal_suggestion_suffix, trim_line, truncate_path};
+    use std::collections::BTreeSet;
+
+    use super::{
+        screenshot_target, terminal_suggestion_suffix, trim_line, truncate_path,
+        update_selected_blocks,
+    };
     use crate::shell::{
-        directory_picker_options, format_command_context_line, history_entry_for_offset,
-        shell_quote_path, terminal_suggestion_suffix as shell_suggestion_suffix,
+        command_suggestion, directory_picker_options, format_command_context_line,
+        history_entry_for_offset, shell_quote_path,
     };
     use crate::transcript::{
         command_block_has_error, command_clears_transcript, is_context_block_start,
@@ -871,5 +1357,45 @@ mod tests {
         assert!(!options.iter().any(|option| option.label == "beta"));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn command_suggestion_should_complete_cd_from_directories() {
+        let root = std::env::temp_dir().join(format!(
+            "view-suggest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("visual_interception_event_window")).expect("dir");
+
+        let suggestion = command_suggestion(
+            root.to_str().expect("utf8"),
+            &std::collections::VecDeque::new(),
+            "cd vi",
+        );
+
+        assert_eq!(
+            suggestion.as_deref(),
+            Some("cd visual_interception_event_window")
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn update_selected_blocks_should_toggle_and_support_shift_multi_select() {
+        let mut selected = BTreeSet::new();
+        update_selected_blocks(&mut selected, 2, false);
+        assert_eq!(selected, BTreeSet::from([2]));
+
+        update_selected_blocks(&mut selected, 2, false);
+        assert!(selected.is_empty());
+
+        update_selected_blocks(&mut selected, 2, false);
+        update_selected_blocks(&mut selected, 3, true);
+        assert_eq!(selected, BTreeSet::from([2, 3]));
     }
 }

@@ -293,9 +293,6 @@ async fn emit_demo_step(
 #[cfg(test)]
 mod tests {
     use super::{demo_agents, demo_events, demo_mode_from_value};
-    use crate::app::Agent;
-    use chrono::Local;
-    use std::collections::{BTreeMap, VecDeque};
 
     #[test]
     fn demo_mode_from_value_should_accept_common_truthy_inputs() {
