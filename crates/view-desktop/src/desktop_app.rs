@@ -5,8 +5,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
+use parking_lot::RwLock;
 use tokio::runtime::Builder;
-use tokio::sync::Mutex;
 use tokio::time::{self, Duration};
 use view_core::{
     app::AppState,
@@ -36,7 +36,7 @@ const ERROR_PANEL_BG: Color32 = Color32::from_rgb(96, 40, 40);
 const ERROR_TEXT: Color32 = Color32::from_rgb(255, 228, 228);
 
 pub struct ViewDesktopApp {
-    state: Arc<Mutex<AppState>>,
+    state: Arc<RwLock<AppState>>,
     shell_input: String,
     history_offset: usize,
     directory_picker_open: bool,
@@ -52,7 +52,7 @@ impl ViewDesktopApp {
         debug_log("desktop app: new()".to_string());
         configure_theme(&cc.egui_ctx);
 
-        let state = Arc::new(Mutex::new(AppState::new()));
+        let state = Arc::new(RwLock::new(AppState::new()));
         let shell_txs = spawn_core_runtime(state.clone());
 
         Self {
@@ -114,7 +114,7 @@ impl eframe::App for ViewDesktopApp {
         self.frame_count += 1;
         debug_log(format!("frame={} entering update", self.frame_count));
 
-        let mut state = self.state.blocking_lock();
+        let mut state = self.state.write();
         shortcuts::handle(ctx, &mut state);
 
         egui::CentralPanel::default()
@@ -648,7 +648,7 @@ fn render_focus_terminal(
     });
 }
 
-fn spawn_core_runtime(state: Arc<Mutex<AppState>>) -> Vec<terminal::TerminalCommandTx> {
+fn spawn_core_runtime(state: Arc<RwLock<AppState>>) -> Vec<terminal::TerminalCommandTx> {
     let mut shell_txs = Vec::new();
     let mut shell_rxs = Vec::new();
     for _ in 0..1 {
@@ -698,15 +698,15 @@ fn spawn_core_runtime(state: Arc<Mutex<AppState>>) -> Vec<terminal::TerminalComm
             loop {
                 tokio::select! {
                     Some(event) = event_rx.recv() => {
-                        let mut app = state.lock().await;
+                        let mut app = state.write();
                         app.add_event(event);
                     }
                     Some(agent) = agent_rx.recv() => {
-                        let mut app = state.lock().await;
+                        let mut app = state.write();
                         app.update_agent(agent);
                     }
                     Some(terminal_event) = terminal_event_rx.recv() => {
-                        let mut app = state.lock().await;
+                        let mut app = state.write();
                         match terminal_event {
                             TerminalEvent::Line { session_id, line } => {
                                 app.append_terminal_line(session_id, line)
@@ -723,7 +723,7 @@ fn spawn_core_runtime(state: Arc<Mutex<AppState>>) -> Vec<terminal::TerminalComm
                         }
                     }
                     _ = tick.tick() => {
-                        let mut app = state.lock().await;
+                        let mut app = state.write();
                         app.tick_activity();
                     }
                 }

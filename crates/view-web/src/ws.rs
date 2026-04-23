@@ -72,7 +72,7 @@ async fn drive_socket(mut socket: WebSocket, state: SharedState) {
 /// Returns `Err(())` if the connection is broken.
 async fn send_snapshot(socket: &mut WebSocket, state: &SharedState) -> Result<(), ()> {
     let snap = {
-        let app = state.lock().await;
+        let app = state.read();
         app.web_snapshot()
     };
 

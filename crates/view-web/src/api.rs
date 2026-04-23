@@ -26,21 +26,21 @@ pub async fn root_info() -> Json<Value> {
 
 /// `GET /api/agents` — all agents as JSON array.
 pub async fn agents(State(state): State<SharedState>) -> impl IntoResponse {
-    let app = state.lock().await;
+    let app = state.read();
     let agents: Vec<_> = app.agents.values().cloned().collect();
     (StatusCode::OK, Json(agents))
 }
 
 /// `GET /api/events` — last 20 events as JSON array.
 pub async fn events(State(state): State<SharedState>) -> impl IntoResponse {
-    let app = state.lock().await;
+    let app = state.read();
     let events: Vec<_> = app.events.iter().take(20).cloned().collect();
     (StatusCode::OK, Json(events))
 }
 
 /// `GET /api/snapshot` — complete `WebSnapshot` (agents + events + terminals).
 pub async fn snapshot(State(state): State<SharedState>) -> impl IntoResponse {
-    let app = state.lock().await;
+    let app = state.read();
     let snap = app.web_snapshot();
     (StatusCode::OK, Json(snap))
 }

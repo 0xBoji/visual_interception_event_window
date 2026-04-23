@@ -13,7 +13,8 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::sync::{mpsc, Mutex};
+use parking_lot::RwLock;
+use tokio::sync::mpsc;
 
 use anyhow::Result;
 use crossterm::{
@@ -50,7 +51,7 @@ impl Drop for TerminalGuard {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let app_state = Arc::new(Mutex::new(AppState::new()));
+    let app_state = Arc::new(RwLock::new(AppState::new()));
     let (event_tx, mut event_rx) = mpsc::channel::<Event>(32);
     let (agent_tx, mut agent_rx) = mpsc::channel::<Agent>(32);
 
@@ -71,18 +72,18 @@ async fn main() -> Result<()> {
         frame_count += 1;
 
         while let Ok(event) = event_rx.try_recv() {
-            let mut state = app_state.lock().await;
+            let mut state = app_state.write();
             state.add_event(event);
         }
 
         while let Ok(agent) = agent_rx.try_recv() {
-            let mut state = app_state.lock().await;
+            let mut state = app_state.write();
             state.update_agent(agent);
         }
 
         if event::poll(Duration::from_millis(0))? {
             if let CEvent::Key(key) = event::read()? {
-                let mut state = app_state.lock().await;
+                let mut state = app_state.write();
                 if state.search_mode {
                     match (key.code, key.modifiers) {
                         (KeyCode::Esc, _) => {
@@ -118,7 +119,7 @@ async fn main() -> Result<()> {
         }
 
         {
-            let mut state = app_state.lock().await;
+            let mut state = app_state.write();
             if state.should_quit {
                 break;
             }

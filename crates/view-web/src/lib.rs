@@ -30,13 +30,13 @@ pub mod ws;
 use anyhow::Result;
 use axum::{routing::get, Router};
 use std::sync::Arc;
+use parking_lot::RwLock;
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 use view_core::app::AppState;
 
 /// Shared state type threaded through Axum handlers.
-pub type SharedState = Arc<Mutex<AppState>>;
+pub type SharedState = Arc<RwLock<AppState>>;
 
 /// Start the VIEW web server, binding to `0.0.0.0:{port}`.
 ///
