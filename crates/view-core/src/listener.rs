@@ -1,44 +1,10 @@
-use crate::app::{Agent, Event, EventRecord, SnapshotRecord};
+use crate::app::{Agent, Event};
 use chrono::Local;
 use std::collections::{BTreeMap, VecDeque};
-use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CampWatchCommandConfig {
-    args: &'static [&'static str],
-    silence_stderr: bool,
-}
-
-fn build_event_from_agent_record(record: &EventRecord, agent: &Agent) -> Event {
-    let component = agent
-        .metadata
-        .get("rai_component")
-        .cloned()
-        .unwrap_or_else(|| "mesh".to_string());
-    let level = agent
-        .metadata
-        .get("rai_level")
-        .cloned()
-        .unwrap_or_else(|| "info".to_string());
-    let payload = agent
-        .metadata
-        .get("log")
-        .cloned()
-        .unwrap_or_else(|| format!("Agent {} via {}", record.kind, record.origin));
-
-    Event {
-        timestamp: chrono::Local::now(),
-        agent_id: agent.id.clone(),
-        kind: record.kind.to_uppercase(),
-        component,
-        level,
-        payload,
-    }
-}
+// Camp logic has been removed.
 
 pub fn demo_mode_enabled() -> bool {
     std::env::var("VIEW_DEMO")
@@ -53,39 +19,7 @@ fn demo_mode_from_value(value: &str) -> bool {
     )
 }
 
-fn build_left_event(record: &EventRecord, agent_id: String) -> Event {
-    Event {
-        timestamp: chrono::Local::now(),
-        agent_id,
-        kind: "LEFT".to_string(),
-        component: "mesh".to_string(),
-        level: "info".to_string(),
-        payload: format!(
-            "Agent left mesh (reason: {})",
-            record
-                .reason
-                .clone()
-                .unwrap_or_else(|| "unknown".to_string())
-        ),
-    }
-}
-
-fn camp_watch_command_config() -> CampWatchCommandConfig {
-    CampWatchCommandConfig {
-        args: &["watch"],
-        silence_stderr: true,
-    }
-}
-
-fn build_camp_watch_command() -> Command {
-    let config = camp_watch_command_config();
-    let mut command = Command::new("camp");
-    command.args(config.args).stdout(Stdio::piped());
-    if config.silence_stderr {
-        command.stderr(Stdio::null());
-    }
-    command
-}
+// Camp logic has been removed.
 
 fn demo_agents(step: usize) -> Vec<Agent> {
     let statuses = [
@@ -354,137 +288,14 @@ async fn emit_demo_step(
     Ok(())
 }
 
-/// Connects to the real-time mesh via `camp watch --json`.
-pub async fn start_camp_listener(
-    tx: mpsc::Sender<Event>,
-    agent_tx: mpsc::Sender<Agent>,
-) -> anyhow::Result<()> {
-    let mut child = build_camp_watch_command().spawn().map_err(|e| {
-        anyhow::anyhow!("Failed to start 'camp' process: {}. Is it in your PATH?", e)
-    })?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("Failed to capture camp stdout"))?;
-    let mut reader = BufReader::new(stdout).lines();
-
-    while let Some(line) = reader.next_line().await? {
-        if line.is_empty() {
-            continue;
-        }
-
-        // Try parsing as a Snapshot first (initial state)
-        if let Ok(snapshot) = serde_json::from_str::<SnapshotRecord>(&line) {
-            for agent in snapshot.agents {
-                let _ = agent_tx.send(agent).await;
-            }
-            continue;
-        }
-
-        // Otherwise parse as an EventRecord
-        if let Ok(record) = serde_json::from_str::<EventRecord>(&line) {
-            match record.kind.as_str() {
-                "joined" | "updated" => {
-                    if let Some(agent) = record.current.as_ref() {
-                        let event = build_event_from_agent_record(&record, agent);
-                        let _ = tx.send(event).await;
-                        let _ = agent_tx.send(agent.clone()).await;
-                    }
-                }
-                "left" => {
-                    if let Some(agent) = record.current.as_ref() {
-                        let mut offline_agent = agent.clone();
-                        offline_agent.status = "Offline".to_string();
-
-                        let event = build_left_event(&record, offline_agent.id.clone());
-                        let _ = tx.send(event).await;
-                        let _ = agent_tx.send(offline_agent).await;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    Ok(())
-}
+// Camp logic has been removed.
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_event_from_agent_record, camp_watch_command_config, demo_agents, demo_events,
-        demo_mode_from_value,
-    };
-    use crate::app::{Agent, EventRecord};
+    use super::{demo_agents, demo_events, demo_mode_from_value};
+    use crate::app::Agent;
     use chrono::Local;
     use std::collections::{BTreeMap, VecDeque};
-
-    fn test_agent(metadata: &[(&str, &str)]) -> Agent {
-        Agent {
-            id: "agent-1".to_string(),
-            instance_name: "agent-1".to_string(),
-            role: "executor".to_string(),
-            project: "view".to_string(),
-            branch: "main".to_string(),
-            status: "busy".to_string(),
-            capabilities: Vec::new(),
-            port: 0,
-            addresses: Vec::new(),
-            metadata: metadata
-                .iter()
-                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-                .collect::<BTreeMap<_, _>>(),
-            last_seen: Local::now(),
-            tokens: 0,
-            activity: VecDeque::from(vec![0; 50]),
-        }
-    }
-
-    fn test_record() -> EventRecord {
-        EventRecord {
-            kind: "updated".to_string(),
-            origin: "camp".to_string(),
-            reason: None,
-            previous: None,
-            current: None,
-        }
-    }
-
-    #[test]
-    fn build_event_from_agent_record_should_use_rai_component_and_level_metadata() {
-        let record = test_record();
-        let agent = test_agent(&[
-            ("rai_component", "tick"),
-            ("rai_level", "warn"),
-            ("log", "Queue is backing up"),
-        ]);
-
-        let event = build_event_from_agent_record(&record, &agent);
-
-        assert_eq!(event.component, "tick");
-        assert_eq!(event.level, "warn");
-        assert_eq!(event.payload, "Queue is backing up");
-    }
-
-    #[test]
-    fn build_event_from_agent_record_should_default_missing_level_to_info() {
-        let record = test_record();
-        let agent = test_agent(&[("rai_component", "garc"), ("log", "Dispatch ready")]);
-
-        let event = build_event_from_agent_record(&record, &agent);
-
-        assert_eq!(event.component, "garc");
-        assert_eq!(event.level, "info");
-    }
-
-    #[test]
-    fn camp_watch_command_config_should_avoid_json_flag_and_silence_stderr() {
-        let config = camp_watch_command_config();
-
-        assert_eq!(config.args, &["watch"]);
-        assert!(config.silence_stderr);
-    }
 
     #[test]
     fn demo_mode_from_value_should_accept_common_truthy_inputs() {

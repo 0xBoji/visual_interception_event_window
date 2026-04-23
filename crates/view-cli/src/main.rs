@@ -54,13 +54,8 @@ async fn main() -> Result<()> {
     let (event_tx, mut event_rx) = mpsc::channel::<Event>(32);
     let (agent_tx, mut agent_rx) = mpsc::channel::<Agent>(32);
 
-    let use_demo = listener::demo_mode_enabled();
     let listener_handle = tokio::spawn(async move {
-        let result = if use_demo {
-            listener::start_demo_listener(event_tx, agent_tx).await
-        } else {
-            listener::start_camp_listener(event_tx, agent_tx).await
-        };
+        let result = listener::start_demo_listener(event_tx, agent_tx).await;
 
         if let Err(error) = result {
             eprintln!("Listener error: {error}");

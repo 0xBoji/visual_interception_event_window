@@ -36,21 +36,7 @@ pub struct Event {
     pub payload: String,
 }
 
-/// Matches CAMP's JSON EventRecord
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EventRecord {
-    pub kind: String,
-    pub origin: String,
-    pub reason: Option<String>,
-    pub previous: Option<Agent>,
-    pub current: Option<Agent>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnapshotRecord {
-    pub kind: String,
-    pub agents: Vec<Agent>,
-}
+// Camp data structures (EventRecord, SnapshotRecord) removed.
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct AgentStatusSummary {
