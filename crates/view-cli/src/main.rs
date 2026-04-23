@@ -4,9 +4,7 @@ mod app {
     pub use view_core::app::*;
 }
 
-mod listener {
-    pub use view_core::listener::*;
-}
+// Listener module no longer needed, Engine handles it
 
 use std::{
     io::{self, Stdout},
@@ -14,7 +12,6 @@ use std::{
     time::Duration,
 };
 use parking_lot::RwLock;
-use tokio::sync::mpsc;
 
 use anyhow::Result;
 use crossterm::{
@@ -24,7 +21,8 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use crate::app::{Agent, AppState, Event};
+use crate::app::AppState;
+use view_core::engine::CoreEngine;
 
 /// RAII Guard to ensure terminal is restored on exit, even during panics.
 struct TerminalGuard {
@@ -52,34 +50,17 @@ impl Drop for TerminalGuard {
 #[tokio::main]
 async fn main() -> Result<()> {
     let app_state = Arc::new(RwLock::new(AppState::new()));
-    let (event_tx, mut event_rx) = mpsc::channel::<Event>(32);
-    let (agent_tx, mut agent_rx) = mpsc::channel::<Agent>(32);
-
-    let listener_handle = tokio::spawn(async move {
-        let result = listener::start_demo_listener(event_tx, agent_tx).await;
-
-        if let Err(error) = result {
-            eprintln!("Listener error: {error}");
-        }
-    });
+    
+    // Spawn the core engine which manages all background processes and state mutations
+    let _action_tx = CoreEngine::spawn_background(app_state.clone());
 
     let mut guard = TerminalGuard::new()?;
-    let mut frame_count: u64 = 0;
     let mut interval = tokio::time::interval(Duration::from_millis(16));
 
     loop {
         interval.tick().await;
-        frame_count += 1;
 
-        while let Ok(event) = event_rx.try_recv() {
-            let mut state = app_state.write();
-            state.add_event(event);
-        }
-
-        while let Ok(agent) = agent_rx.try_recv() {
-            let mut state = app_state.write();
-            state.update_agent(agent);
-        }
+        // UI only reads state and handles input; CoreEngine mutates the rest!
 
         if event::poll(Duration::from_millis(0))? {
             if let CEvent::Key(key) = event::read()? {
@@ -119,18 +100,13 @@ async fn main() -> Result<()> {
         }
 
         {
-            let mut state = app_state.write();
+            let state = app_state.read();
             if state.should_quit {
                 break;
-            }
-            if frame_count.is_multiple_of(60) {
-                state.tick_activity();
             }
             guard.terminal.draw(|frame| ui::render(frame, &state))?;
         }
     }
-
-    listener_handle.abort();
 
     Ok(())
 }

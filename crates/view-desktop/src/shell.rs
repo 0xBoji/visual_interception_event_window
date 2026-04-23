@@ -6,7 +6,8 @@
 use std::path::Path;
 use std::process::Command;
 use view_core::app::AppState;
-use view_core::terminal;
+use view_core::engine::Action;
+use tokio::sync::mpsc;
 
 // ── Git helpers ────────────────────────────────────────────────────────────────
 
@@ -152,13 +153,14 @@ pub fn directory_picker_options(cwd: &str, query: &str) -> Vec<DirectoryOption> 
 /// Returns `true` if the command was dispatched successfully.
 pub fn submit_shell_command(
     state: &mut AppState,
-    shell_txs: &[terminal::TerminalCommandTx],
+    action_tx: mpsc::UnboundedSender<Action>,
     history_offset: &mut usize,
     command: String,
 ) -> bool {
-    let Some(tx) = shell_txs.get(state.selected_terminal_idx) else {
+    let session_id = state.selected_terminal_idx;
+    if state.selected_terminal().is_none() {
         return false;
-    };
+    }
 
     state.append_terminal_history(state.selected_terminal_idx, command.clone());
 
@@ -181,7 +183,10 @@ pub fn submit_shell_command(
         state.append_terminal_line(state.selected_terminal_idx, format!("$ {command}"));
     }
 
-    let _ = tx.send(command);
+    let _ = action_tx.send(Action::SubmitCommand {
+        session_id,
+        command,
+    });
     *history_offset = 0;
     true
 }

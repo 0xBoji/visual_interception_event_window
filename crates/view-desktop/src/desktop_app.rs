@@ -10,9 +10,11 @@ use tokio::runtime::Builder;
 use tokio::time::{self, Duration};
 use view_core::{
     app::AppState,
+    engine::{Action, CoreEngine},
     listener,
     terminal::{self, TerminalEvent},
 };
+use tokio::sync::mpsc;
 
 use crate::{
     shell,
@@ -41,7 +43,7 @@ pub struct ViewDesktopApp {
     history_offset: usize,
     directory_picker_open: bool,
     directory_picker_query: String,
-    shell_txs: Vec<terminal::TerminalCommandTx>,
+    action_tx: mpsc::UnboundedSender<Action>,
     frame_count: u64,
     screenshot_requested: bool,
     screenshot_target: Option<PathBuf>,
@@ -53,7 +55,7 @@ impl ViewDesktopApp {
         configure_theme(&cc.egui_ctx);
 
         let state = Arc::new(RwLock::new(AppState::new()));
-        let shell_txs = spawn_core_runtime(state.clone());
+        let action_tx = spawn_core_runtime(state.clone());
 
         Self {
             state,
@@ -61,7 +63,7 @@ impl ViewDesktopApp {
             history_offset: 0,
             directory_picker_open: false,
             directory_picker_query: String::new(),
-            shell_txs,
+            action_tx,
             frame_count: 0,
             screenshot_requested: false,
             screenshot_target: screenshot_target(),
@@ -87,11 +89,11 @@ fn directory_picker_options(cwd: &str, query: &str) -> Vec<shell::DirectoryOptio
 
 fn submit_shell_command(
     state: &mut AppState,
-    shell_txs: &[terminal::TerminalCommandTx],
+    action_tx: mpsc::UnboundedSender<Action>,
     history_offset: &mut usize,
     command: String,
 ) -> bool {
-    shell::submit_shell_command(state, shell_txs, history_offset, command)
+    shell::submit_shell_command(state, action_tx, history_offset, command)
 }
 
 fn history_entry_for_offset(
@@ -127,7 +129,7 @@ impl eframe::App for ViewDesktopApp {
                     &mut self.history_offset,
                     &mut self.directory_picker_open,
                     &mut self.directory_picker_query,
-                    &self.shell_txs,
+                    &self.action_tx,
                 )
             });
 
@@ -188,7 +190,7 @@ fn render_focus(
     history_offset: &mut usize,
     directory_picker_open: &mut bool,
     directory_picker_query: &mut String,
-    shell_txs: &[terminal::TerminalCommandTx],
+    action_tx: &mpsc::UnboundedSender<Action>,
 ) {
     if let Some(session) = state.selected_terminal().cloned() {
         render_focus_terminal(
@@ -199,7 +201,7 @@ fn render_focus(
             history_offset,
             directory_picker_open,
             directory_picker_query,
-            shell_txs,
+            action_tx,
         );
     } else {
         ui.label("No session selected.");
@@ -258,7 +260,7 @@ fn render_focus_terminal(
     history_offset: &mut usize,
     directory_picker_open: &mut bool,
     directory_picker_query: &mut String,
-    shell_txs: &[terminal::TerminalCommandTx],
+    action_tx: &mpsc::UnboundedSender<Action>,
 ) {
     ui.add_space(14.0);
     ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
@@ -494,7 +496,7 @@ fn render_focus_terminal(
                             if response.clicked() {
                                 let command =
                                     format!("cd {}", shell_quote_path(&option.target_path));
-                                if submit_shell_command(state, shell_txs, history_offset, command) {
+                                if submit_shell_command(state, action_tx.clone(), history_offset, command) {
                                     shell_input.clear();
                                     close_picker = true;
                                 }
@@ -640,7 +642,7 @@ fn render_focus_terminal(
             && !shell_input.trim().is_empty()
         {
             let command = shell_input.trim().to_string();
-            if submit_shell_command(state, shell_txs, history_offset, command) {
+            if submit_shell_command(state, action_tx.clone(), history_offset, command) {
                 shell_input.clear();
                 ui.memory_mut(|memory| memory.request_focus(input_id));
             }
@@ -648,14 +650,9 @@ fn render_focus_terminal(
     });
 }
 
-fn spawn_core_runtime(state: Arc<RwLock<AppState>>) -> Vec<terminal::TerminalCommandTx> {
-    let mut shell_txs = Vec::new();
-    let mut shell_rxs = Vec::new();
-    for _ in 0..1 {
-        let (tx, rx) = terminal::local_shell_command_tx();
-        shell_txs.push(tx);
-        shell_rxs.push(rx);
-    }
+fn spawn_core_runtime(state: Arc<RwLock<AppState>>) -> mpsc::UnboundedSender<Action> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<mpsc::UnboundedSender<Action>>();
+    
     thread::spawn(move || {
         let runtime = Builder::new_multi_thread()
             .enable_all()
@@ -663,9 +660,13 @@ fn spawn_core_runtime(state: Arc<RwLock<AppState>>) -> Vec<terminal::TerminalCom
             .expect("desktop runtime");
 
         runtime.block_on(async move {
-            let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
-            let (agent_tx, mut agent_rx) = tokio::sync::mpsc::channel(64);
-            let (terminal_event_tx, mut terminal_event_rx) = tokio::sync::mpsc::unbounded_channel();
+            // Give the engine an action_tx so it can be returned via our proxy channel
+            let action_tx = CoreEngine::spawn_background(state.clone());
+            let _ = tx.send(action_tx.clone());
+
+            // 1 default terminal initially
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
+            let _ = action_tx.send(Action::SpawnTerminal { cwd });
 
             // Spawn LAN web server (REST + WebSocket) on a background task.
             let web_state = state.clone();
@@ -679,58 +680,13 @@ fn spawn_core_runtime(state: Arc<RwLock<AppState>>) -> Vec<terminal::TerminalCom
                 }
             });
 
-            tokio::spawn(async move {
-                let _ = listener::start_demo_listener(event_tx, agent_tx).await;
-            });
-
-            for (session_id, shell_rx) in shell_rxs.into_iter().enumerate() {
-                let terminal_event_tx = terminal_event_tx.clone();
-                tokio::spawn(async move {
-                    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
-                    let _ =
-                        terminal::start_local_shell(session_id, cwd, terminal_event_tx, shell_rx)
-                            .await;
-                });
-            }
-
-            let mut tick = time::interval(Duration::from_secs(1));
-
-            loop {
-                tokio::select! {
-                    Some(event) = event_rx.recv() => {
-                        let mut app = state.write();
-                        app.add_event(event);
-                    }
-                    Some(agent) = agent_rx.recv() => {
-                        let mut app = state.write();
-                        app.update_agent(agent);
-                    }
-                    Some(terminal_event) = terminal_event_rx.recv() => {
-                        let mut app = state.write();
-                        match terminal_event {
-                            TerminalEvent::Line { session_id, line } => {
-                                app.append_terminal_line(session_id, line)
-                            }
-                            TerminalEvent::Status { session_id, status } => {
-                                app.set_terminal_status(session_id, status)
-                            }
-                            TerminalEvent::Cwd { session_id, cwd } => {
-                                app.set_terminal_cwd(session_id, cwd)
-                            }
-                            TerminalEvent::Timing { session_id, seconds } => {
-                                app.finalize_terminal_context_line(session_id, seconds)
-                            }
-                        }
-                    }
-                    _ = tick.tick() => {
-                        let mut app = state.write();
-                        app.tick_activity();
-                    }
-                }
-            }
+            // Keep runtime alive
+            std::future::pending::<()>().await;
         });
     });
-    shell_txs
+    
+    // Wait for the runtime to boot up and return the actual action_tx
+    rx.blocking_recv().expect("Failed to receive action_tx from background thread")
 }
 
 fn screenshot_target() -> Option<PathBuf> {
