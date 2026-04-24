@@ -189,3 +189,92 @@ pub fn terminal_suggestion_suffix(input: &str, suggestion: Option<&str>) -> Opti
     }
     suggestion.strip_prefix(input).map(ToOwned::to_owned)
 }
+
+// ── Branch picker ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchOption {
+    pub label: String,
+    pub is_current: bool,
+}
+
+pub fn branch_picker_options(cwd: &str, query: &str) -> Vec<BranchOption> {
+    let query = query.trim().to_lowercase();
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .arg("branch")
+        .arg("--format=%(refname:short) %(HEAD)")
+        .output();
+
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    let mut options: Vec<BranchOption> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (name, marker) = line.rsplit_once(' ')?;
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            if !query.is_empty() && !name.to_lowercase().contains(&query) {
+                return None;
+            }
+            Some(BranchOption {
+                label: name,
+                is_current: marker.trim() == "*",
+            })
+        })
+        .collect();
+
+    // Sort: current branch first, then alphabetical
+    options.sort_by(|a, b| b.is_current.cmp(&a.is_current).then(a.label.cmp(&b.label)));
+    options
+}
+
+// ── Command suggestion ─────────────────────────────────────────────────────────
+
+fn cd_directory_suggestion(cwd: &str, input: &str) -> Option<String> {
+    let prefix = input.strip_prefix("cd ")?;
+    if prefix.is_empty() || prefix.contains(' ') || prefix.contains('\'') || prefix.contains('"') {
+        return None;
+    }
+
+    let path = Path::new(cwd);
+    let mut matches = std::fs::read_dir(path)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_dir()))
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with(prefix))
+        .collect::<Vec<_>>();
+
+    matches.sort_unstable();
+    let first = matches.into_iter().next()?;
+    Some(format!("cd {first}"))
+}
+
+/// Returns the best matching directory/history suggestion for the given input prefix.
+pub fn command_suggestion(
+    cwd: &str,
+    history: &std::collections::VecDeque<String>,
+    input: &str,
+) -> Option<String> {
+    cd_directory_suggestion(cwd, input).or_else(|| {
+        if input.trim().is_empty() {
+            return None;
+        }
+        history
+            .iter()
+            .rev()
+            .find(|cmd| cmd.starts_with(input) && cmd.as_str() != input)
+            .cloned()
+    })
+}
